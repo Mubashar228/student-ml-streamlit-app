@@ -1,7 +1,7 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -66,6 +66,8 @@ def seed_example_data():
                     ("Ali", "03001234567", "Grade 5", "B"),
                     ("Sara", "03007654321", "Grade 5", "A"),
                     ("Hassan", "03001112233", "Grade 4", "C"),
+                    ("Fatima", "03009876543", "Grade 6", "A"),
+                    ("Zain", "03005554433", "Grade 5", "D"),
                 ],
             )
             conn.commit()
@@ -89,12 +91,6 @@ def seed_example_data():
 # -----------------------------
 
 class SimpleGradeModel:
-    """
-    Retrains quickly from DB on demand. Target uses students.previous_result
-    as a proxy label. When enough routine rows exist, we train; otherwise
-    we fall back to a rule-of-thumb heuristic.
-    """
-
     def __init__(self):
         self.clf: Optional[DecisionTreeClassifier] = None
         self.le_target: Optional[LabelEncoder] = None
@@ -104,7 +100,6 @@ class SimpleGradeModel:
 
     @staticmethod
     def _encode_features(df: pd.DataFrame) -> pd.DataFrame:
-        # Map categorical features to numeric
         map_yesno = {"Yes": 1, "No": 0}
         map_att = {"Present": 2, "Leave": 1, "Absent": 0}
         df = df.copy()
@@ -115,11 +110,7 @@ class SimpleGradeModel:
 
     def retrain(self, conn) -> None:
         df = pd.read_sql(
-            """
-            SELECT dr.*, s.previous_result
-            FROM daily_routine dr
-            JOIN students s ON s.id = dr.student_id
-            """,
+            "SELECT dr.*, s.previous_result FROM daily_routine dr JOIN students s ON s.id = dr.student_id",
             conn,
         )
         if df.empty:
@@ -129,7 +120,6 @@ class SimpleGradeModel:
         df = self._encode_features(df)
         X = df[["shoes_num", "uniform_num", "attendance_num"]]
         y = df["previous_result"].astype(str)
-        # Need at least 15 rows to be minimally meaningful
         if len(df) < 15:
             self.ready = False
             self.train_rows = len(df)
@@ -138,7 +128,6 @@ class SimpleGradeModel:
         y_enc = self.le_target.fit_transform(y)
         clf = DecisionTreeClassifier(random_state=42, max_depth=4)
         clf.fit(X, y_enc)
-        # quick resubstitution accuracy for info only
         y_hat = clf.predict(X)
         acc = accuracy_score(y_enc, y_hat)
         self.clf = clf
@@ -147,10 +136,6 @@ class SimpleGradeModel:
         self.train_rows = len(df)
 
     def predict_grade(self, shoes: str, uniform: str, attendance: str) -> Tuple[str, str]:
-        """Returns (grade, info) as tuple.
-        If model not ready, uses heuristic.
-        """
-        # Heuristic fallback
         def heuristic():
             score = 0
             if shoes == "Yes":
@@ -158,7 +143,6 @@ class SimpleGradeModel:
             if uniform == "Yes":
                 score += 1
             score += {"Present": 2, "Leave": 1, "Absent": 0}.get(attendance, 0)
-            # Map score 0-4 to grades
             if score >= 4:
                 return "A"
             if score == 3:
@@ -171,46 +155,63 @@ class SimpleGradeModel:
 
         if not self.ready or self.clf is None or self.le_target is None:
             g = heuristic()
-            return g, "Heuristic (model will train automatically when enough data is available)."
-        # model path
-        X = np.array(
-            [
-                [
-                    1 if shoes == "Yes" else 0,
-                    1 if uniform == "Yes" else 0,
-                    {"Present": 2, "Leave": 1, "Absent": 0}.get(attendance, 0),
-                ]
-            ]
-        )
+            return g, "Heuristic (model trains automatically when 15+ rows exist)."
+        X = np.array([[1 if shoes == "Yes" else 0, 1 if uniform == "Yes" else 0, {"Present": 2, "Leave": 1, "Absent": 0}.get(attendance, 0)]])
         y_hat = self.clf.predict(X)
         grade = self.le_target.inverse_transform(y_hat)[0]
         return grade, f"ML model (trained on {self.train_rows} rows, approx. acc {self.train_acc:.2f})."
 
 
 # -----------------------------
+# Helper functions for analytics
+# -----------------------------
+
+def attendance_percent(df_r: pd.DataFrame) -> float:
+    if df_r.empty:
+        return 0.0
+    return (df_r["attendance"] == "Present").sum() / len(df_r)
+
+
+def compliance_percent(df_r: pd.DataFrame, col_name: str) -> float:
+    if df_r.empty:
+        return 0.0
+    return (df_r[col_name] == "Yes").sum() / len(df_r)
+
+
+def compute_student_score(df_r: pd.DataFrame, prev_grade: str) -> float:
+    # Simple scoring: attendance weight 0.6, compliance 0.2, previous_result mapping 0.2
+    if df_r.empty:
+        base_att = 0.0
+        comp = 0.0
+    else:
+        base_att = (df_r["attendance"] == "Present").sum() / len(df_r)
+        comp = ((df_r["shoes"] == "Yes").sum() + (df_r["uniform"] == "Yes").sum()) / (2 * len(df_r))
+    grade_map = {"A": 1.0, "B": 0.8, "C": 0.6, "D": 0.4, "F": 0.2}
+    g_val = grade_map.get(prev_grade, 0.5)
+    score = 0.6 * base_att + 0.2 * comp + 0.2 * g_val
+    return score
+
+
+# -----------------------------
 # Streamlit App
 # -----------------------------
 
-st.set_page_config(page_title="Student Performance & Routine (ML)", page_icon="🎓", layout="wide")
-
-# Initialize DB and (optionally) seed
+st.set_page_config(page_title="Govt Model Elementary School Chak.243 JB", page_icon="🎓", layout="wide")
 init_db()
+
 if st.sidebar.checkbox("Load demo data (optional)"):
     seed_example_data()
 
-# Build/retrain model on demand
 model = SimpleGradeModel()
 with get_conn() as _conn:
     model.retrain(_conn)
 
-st.title("🎓 Student Performance & Daily Routine —GGPS Chak 243 JB")
-st.caption(
-    "Add students, record daily routine (shoes, uniform, attendance), and get an instant predicted grade."
-)
+st.title("🎓 Govt Model Elementary School Chak.243 JB — Student Performance & Daily Routine ML App")
+st.caption("Add students, record daily routine, get instant predicted grade, and view analytics (weekly/monthly/yearly).")
 
 # Tabs for UX
-tab_add_student, tab_add_routine, tab_dashboard, tab_data = st.tabs(
-    ["➕ Add Student", "📝 Daily Entry", "📊 Dashboard", "🗂️ Data"]
+tab_add_student, tab_quick_entry, tab_add_routine, tab_analytics, tab_dashboard, tab_data = st.tabs(
+    ["➕ Add Student", "⚡ Quick Daily Entry", "📝 Full Daily Entry", "📈 Analytics", "📊 Dashboard", "🗂️ Data"]
 )
 
 # -----------------------------
@@ -241,25 +242,58 @@ with tab_add_student:
                 st.success(f"Student '{name}' added successfully!")
 
 # -----------------------------
-# Daily Entry Tab
+# Quick Daily Entry Tab
+# -----------------------------
+with tab_quick_entry:
+    st.subheader("Quick Daily Entry — Just tick and save (fast for teachers)")
+    with get_conn() as conn:
+        students_df = pd.read_sql("SELECT id, name, class_name FROM students ORDER BY name", conn)
+    if students_df.empty:
+        st.info("No students found. Please add students first.")
+    else:
+        date_col, cols = st.columns([1, 4])
+        entry_date = date_col.date_input("Date", value=date.today())
+        # We'll display a table-like set of inputs
+        with st.form("quick_form"):
+            rows = []
+            for _, r in students_df.iterrows():
+                sid = int(r["id"])
+                name_label = f"{r['name']} (ID {sid}) — {r['class_name']}"
+                c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+                with c1:
+                    st.markdown(f"**{name_label}**")
+                with c2:
+                    shoes = st.radio(f"shoes_{sid}", ["Yes", "No"], index=0, key=f"sh_{sid}")
+                with c3:
+                    uniform = st.radio(f"uniform_{sid}", ["Yes", "No"], index=0, key=f"un_{sid}")
+                with c4:
+                    attendance = st.selectbox(f"att_{sid}", ["Present", "Absent", "Leave"], index=0, key=f"att_{sid}")
+                rows.append((sid, entry_date.isoformat(), shoes, uniform, attendance, ""))
+            save = st.form_submit_button("Save All Quick Entries & Predict")
+        if save:
+            with get_conn() as conn:
+                conn.executemany(
+                    "INSERT INTO daily_routine(student_id, date, shoes, uniform, attendance, notes) VALUES (?,?,?,?,?,?)",
+                    rows,
+                )
+                conn.commit()
+            # retrain and show summary
+            with get_conn() as _c:
+                model.retrain(_c)
+            st.success("Saved quick entries for all students.")
+
+# -----------------------------
+# Full Daily Entry Tab
 # -----------------------------
 with tab_add_routine:
-    st.subheader("Record today's routine & get prediction")
-    # Load students for selection
+    st.subheader("Full Daily Entry (per student) — with notes & single student selection")
     with get_conn() as conn:
         students_df = pd.read_sql("SELECT id, name, class_name FROM students ORDER BY name", conn)
     if students_df.empty:
         st.info("No students found. Please add a student first.")
     else:
-        students_df["label"] = students_df.apply(
-            lambda r: f"{r['name']} (ID {r['id']}) — {r['class_name']}", axis=1
-        )
-        selected = st.selectbox(
-            "Select Student",
-            options=students_df["id"].tolist(),
-            format_func=lambda sid: students_df.loc[students_df.id == sid, "label"].values[0],
-        )
-        today_str = date.today().isoformat()
+        students_df["label"] = students_df.apply(lambda r: f"{r['name']} (ID {r['id']}) — {r['class_name']}", axis=1)
+        selected = st.selectbox("Select Student", options=students_df["id"].tolist(), format_func=lambda sid: students_df.loc[students_df.id == sid, "label"].values[0])
         with st.form("routine_form", clear_on_submit=True):
             c1, c2, c3, c4 = st.columns(4)
             with c1:
@@ -279,7 +313,6 @@ with tab_add_routine:
                     (int(selected), rdate.isoformat(), shoes, uniform, attendance, notes),
                 )
                 conn.commit()
-            # retrain after new data
             with get_conn() as _c:
                 model.retrain(_c)
             grade, info = model.predict_grade(shoes, uniform, attendance)
@@ -287,30 +320,82 @@ with tab_add_routine:
             st.caption(info)
 
 # -----------------------------
+# Analytics Tab
+# -----------------------------
+with tab_analytics:
+    st.subheader("Analytics — Weekly, Monthly, Yearly")
+    range_type = st.selectbox("Range", ["7 days (weekly)", "30 days (monthly)", "365 days (yearly)"])
+    days_map = {"7 days (weekly)": 7, "30 days (monthly)": 30, "365 days (yearly)": 365}
+    days = days_map[range_type]
+    end = date.today()
+    start = end - timedelta(days=days - 1)
+
+    with get_conn() as conn:
+        all_r = pd.read_sql("SELECT * FROM daily_routine", conn, parse_dates=["date"])
+        all_s = pd.read_sql("SELECT * FROM students", conn)
+    if all_r.empty:
+        st.info("No routine data yet. Add some daily records first.")
+    else:
+        # filter range
+        all_r["date"] = pd.to_datetime(all_r["date"]).dt.date
+        period_r = all_r[(all_r["date"] >= start) & (all_r["date"] <= end)]
+        st.write(f"Showing analytics from **{start.isoformat()}** to **{end.isoformat()}**")
+        # Overall stats
+        total_entries = len(period_r)
+        total_students = all_s.shape[0]
+        present_rate = attendance_percent(period_r)
+        shoes_rate = compliance_percent(period_r, "shoes")
+        uniform_rate = compliance_percent(period_r, "uniform")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Entries", total_entries)
+        c2.metric("Students in DB", total_students)
+        c3.metric("Present Rate", f"{present_rate:.0%}")
+        c4.metric("Shoes Compliance", f"{shoes_rate:.0%}")
+        st.metric("Uniform Compliance", f"{uniform_rate:.0%}")
+
+        # Grade distribution (based on previous_result)
+        st.write("### Grade distribution (students table)")
+        grade_counts = all_s["previous_result"].value_counts().reindex(["A", "B", "C", "D", "F"]).fillna(0)
+        st.bar_chart(grade_counts)
+
+        # Top 5 and Bottom 5 students based on combined score
+        st.write("### Top 5 and Bottom 5 students (based on attendance & compliance & prev result)")
+        scores = []
+        for _, s in all_s.iterrows():
+            sid = int(s["id"])
+            s_r = period_r[period_r["student_id"] == sid]
+            score = compute_student_score(s_r, s["previous_result"])
+            scores.append({"id": sid, "name": s["name"], "class": s["class_name"], "score": score})
+        scores_df = pd.DataFrame(scores)
+        if scores_df.empty:
+            st.info("Not enough student data for ranking.")
+        else:
+            top5 = scores_df.sort_values("score", ascending=False).head(5)
+            bottom5 = scores_df.sort_values("score", ascending=True).head(5)
+            st.write("**Top 5**")
+            st.table(top5.reset_index(drop=True))
+            st.write("**Bottom 5**")
+            st.table(bottom5.reset_index(drop=True))
+
+        # Attendance trend (daily)
+        st.write("### Attendance trend (daily)")
+        daily = period_r.groupby("date")["attendance"].apply(lambda s: (s == "Present").sum() / s.count())
+        st.line_chart(daily)
+
+# -----------------------------
 # Dashboard Tab
 # -----------------------------
 with tab_dashboard:
     st.subheader("Student Dashboard")
     with get_conn() as conn:
-        df_students = pd.read_sql(
-            "SELECT id, name, contact, class_name, previous_result FROM students ORDER BY name",
-            conn,
-        )
+        df_students = pd.read_sql("SELECT id, name, contact, class_name, previous_result FROM students ORDER BY name", conn)
     if df_students.empty:
         st.info("No students yet.")
     else:
-        sid = st.selectbox(
-            "Choose a student",
-            options=df_students["id"].tolist(),
-            format_func=lambda s: df_students.loc[df_students.id == s, "name"].values[0],
-        )
+        sid = st.selectbox("Choose a student", options=df_students["id"].tolist(), format_func=lambda s: df_students.loc[df_students.id == s, "name"].values[0])
         with get_conn() as conn:
             df_profile = df_students[df_students.id == sid].copy()
-            df_r = pd.read_sql(
-                "SELECT date, shoes, uniform, attendance, notes FROM daily_routine WHERE student_id = ? ORDER BY date DESC",
-                conn,
-                params=(int(sid),),
-            )
+            df_r = pd.read_sql("SELECT date, shoes, uniform, attendance, notes FROM daily_routine WHERE student_id = ? ORDER BY date DESC", conn, params=(int(sid),))
         st.write("### Profile")
         p = df_profile.iloc[0]
         c1, c2, c3 = st.columns(3)
@@ -324,15 +409,10 @@ with tab_dashboard:
             st.warning("No routine records yet for this student.")
         else:
             st.dataframe(df_r, use_container_width=True)
-            # Compute latest prediction from most recent row
             last = df_r.iloc[0]
-            g, info = model.predict_grade(
-                shoes=last["shoes"], uniform=last["uniform"], attendance=last["attendance"]
-            )
+            g, info = model.predict_grade(shoes=last["shoes"], uniform=last["uniform"], attendance=last["attendance"])
             st.success(f"Latest Predicted Grade (based on {last['date']}): {g}")
             st.caption(info)
-
-            # Attendance summary (last 30)
             last30 = df_r.head(30)
             att_counts = last30["attendance"].value_counts()
             p_rate = att_counts.get("Present", 0) / max(1, len(last30))
@@ -360,7 +440,4 @@ with tab_data:
             all_routines.to_csv("routines_export.csv", index=False)
             st.success("Saved as routines_export.csv in the app directory.")
 
-# Footer note
-st.caption(
-    "Tip: The ML model trains automatically when 15+ routine records exist. Before that, a simple heuristic is used for predictions."
-)
+st.caption("Tip: Use Quick Daily Entry for fast teacher workflow. Analytics updates automatically for the selected range.")
