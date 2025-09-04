@@ -203,7 +203,7 @@ model = SimpleGradeModel()
 with get_conn() as _conn:
     model.retrain(_conn)
 
-st.title("🎓 Student Performance & Daily Routine — ML Web App")
+st.title("🎓 Student Performance & Daily Routine —GGPS Chak 243 JB")
 st.caption(
     "Add students, record daily routine (shoes, uniform, attendance), and get an instant predicted grade."
 )
