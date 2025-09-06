@@ -179,7 +179,6 @@ def compliance_percent(df_r: pd.DataFrame, col_name: str) -> float:
 
 
 def compute_student_score(df_r: pd.DataFrame, prev_grade: str) -> float:
-    # Simple scoring: attendance weight 0.6, compliance 0.2, previous_result mapping 0.2
     if df_r.empty:
         base_att = 0.0
         comp = 0.0
@@ -207,7 +206,7 @@ with get_conn() as _conn:
     model.retrain(_conn)
 
 st.title("🎓 Govt Model Elementary School Chak.243 JB — Student Performance & Daily Routine ML App")
-st.caption("Add students, record daily routine, get instant predicted grade, and view analytics (weekly/monthly/yearly).")
+st.caption("Add students, record daily routine, get instant predicted grade, and view analytics (weekly/monthly/yearly, class-wise).")
 
 # Tabs for UX
 tab_add_student, tab_quick_entry, tab_add_routine, tab_analytics, tab_dashboard, tab_data = st.tabs(
@@ -253,7 +252,6 @@ with tab_quick_entry:
     else:
         date_col, cols = st.columns([1, 4])
         entry_date = date_col.date_input("Date", value=date.today())
-        # We'll display a table-like set of inputs
         with st.form("quick_form"):
             rows = []
             for _, r in students_df.iterrows():
@@ -277,7 +275,6 @@ with tab_quick_entry:
                     rows,
                 )
                 conn.commit()
-            # retrain and show summary
             with get_conn() as _c:
                 model.retrain(_c)
             st.success("Saved quick entries for all students.")
@@ -320,10 +317,10 @@ with tab_add_routine:
             st.caption(info)
 
 # -----------------------------
-# Analytics Tab
+# Analytics Tab (with class filter)
 # -----------------------------
 with tab_analytics:
-    st.subheader("Analytics — Weekly, Monthly, Yearly")
+    st.subheader("Analytics — Weekly, Monthly, Yearly (Class-wise)")
     range_type = st.selectbox("Range", ["7 days (weekly)", "30 days (monthly)", "365 days (yearly)"])
     days_map = {"7 days (weekly)": 7, "30 days (monthly)": 30, "365 days (yearly)": 365}
     days = days_map[range_type]
@@ -336,11 +333,20 @@ with tab_analytics:
     if all_r.empty:
         st.info("No routine data yet. Add some daily records first.")
     else:
-        # filter range
         all_r["date"] = pd.to_datetime(all_r["date"]).dt.date
+
+        # Class filter
+        classes = sorted(all_s["class_name"].dropna().unique().tolist())
+        class_selected = st.selectbox("Select Class", ["All Classes"] + classes)
+
+        if class_selected != "All Classes":
+            student_ids = all_s[all_s.class_name == class_selected]["id"].tolist()
+            all_r = all_r[all_r.student_id.isin(student_ids)]
+            all_s = all_s[all_s.class_name == class_selected]
+
         period_r = all_r[(all_r["date"] >= start) & (all_r["date"] <= end)]
-        st.write(f"Showing analytics from **{start.isoformat()}** to **{end.isoformat()}**")
-        # Overall stats
+        st.write(f"Showing analytics from **{start.isoformat()}** to **{end.isoformat()}** for **{class_selected}**")
+
         total_entries = len(period_r)
         total_students = all_s.shape[0]
         present_rate = attendance_percent(period_r)
@@ -353,91 +359,5 @@ with tab_analytics:
         c4.metric("Shoes Compliance", f"{shoes_rate:.0%}")
         st.metric("Uniform Compliance", f"{uniform_rate:.0%}")
 
-        # Grade distribution (based on previous_result)
         st.write("### Grade distribution (students table)")
         grade_counts = all_s["previous_result"].value_counts().reindex(["A", "B", "C", "D", "F"]).fillna(0)
-        st.bar_chart(grade_counts)
-
-        # Top 5 and Bottom 5 students based on combined score
-        st.write("### Top 5 and Bottom 5 students (based on attendance & compliance & prev result)")
-        scores = []
-        for _, s in all_s.iterrows():
-            sid = int(s["id"])
-            s_r = period_r[period_r["student_id"] == sid]
-            score = compute_student_score(s_r, s["previous_result"])
-            scores.append({"id": sid, "name": s["name"], "class": s["class_name"], "score": score})
-        scores_df = pd.DataFrame(scores)
-        if scores_df.empty:
-            st.info("Not enough student data for ranking.")
-        else:
-            top5 = scores_df.sort_values("score", ascending=False).head(5)
-            bottom5 = scores_df.sort_values("score", ascending=True).head(5)
-            st.write("**Top 5**")
-            st.table(top5.reset_index(drop=True))
-            st.write("**Bottom 5**")
-            st.table(bottom5.reset_index(drop=True))
-
-        # Attendance trend (daily)
-        st.write("### Attendance trend (daily)")
-        daily = period_r.groupby("date")["attendance"].apply(lambda s: (s == "Present").sum() / s.count())
-        st.line_chart(daily)
-
-# -----------------------------
-# Dashboard Tab
-# -----------------------------
-with tab_dashboard:
-    st.subheader("Student Dashboard")
-    with get_conn() as conn:
-        df_students = pd.read_sql("SELECT id, name, contact, class_name, previous_result FROM students ORDER BY name", conn)
-    if df_students.empty:
-        st.info("No students yet.")
-    else:
-        sid = st.selectbox("Choose a student", options=df_students["id"].tolist(), format_func=lambda s: df_students.loc[df_students.id == s, "name"].values[0])
-        with get_conn() as conn:
-            df_profile = df_students[df_students.id == sid].copy()
-            df_r = pd.read_sql("SELECT date, shoes, uniform, attendance, notes FROM daily_routine WHERE student_id = ? ORDER BY date DESC", conn, params=(int(sid),))
-        st.write("### Profile")
-        p = df_profile.iloc[0]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Name", p["name"])
-        c2.metric("Class", p["class_name"])
-        c3.metric("Contact", p["contact"] if p["contact"] else "—")
-        st.metric("Previous Result", p["previous_result"])  # single line metric
-
-        st.write("### Recent Routine Records")
-        if df_r.empty:
-            st.warning("No routine records yet for this student.")
-        else:
-            st.dataframe(df_r, use_container_width=True)
-            last = df_r.iloc[0]
-            g, info = model.predict_grade(shoes=last["shoes"], uniform=last["uniform"], attendance=last["attendance"])
-            st.success(f"Latest Predicted Grade (based on {last['date']}): {g}")
-            st.caption(info)
-            last30 = df_r.head(30)
-            att_counts = last30["attendance"].value_counts()
-            p_rate = att_counts.get("Present", 0) / max(1, len(last30))
-            st.write(f"**30-day present rate:** {p_rate:.0%}")
-
-# -----------------------------
-# Data Tab
-# -----------------------------
-with tab_data:
-    st.subheader("All Data (Export-ready)")
-    colA, colB = st.columns(2)
-    with get_conn() as conn:
-        all_students = pd.read_sql("SELECT * FROM students ORDER BY id", conn)
-        all_routines = pd.read_sql("SELECT * FROM daily_routine ORDER BY date DESC", conn)
-    with colA:
-        st.write("**Students**")
-        st.dataframe(all_students, use_container_width=True)
-        if st.button("Download Students CSV"):
-            all_students.to_csv("students_export.csv", index=False)
-            st.success("Saved as students_export.csv in the app directory.")
-    with colB:
-        st.write("**Daily Routine**")
-        st.dataframe(all_routines, use_container_width=True)
-        if st.button("Download Routine CSV"):
-            all_routines.to_csv("routines_export.csv", index=False)
-            st.success("Saved as routines_export.csv in the app directory.")
-
-st.caption("Tip: Use Quick Daily Entry for fast teacher workflow. Analytics updates automatically for the selected range.")
